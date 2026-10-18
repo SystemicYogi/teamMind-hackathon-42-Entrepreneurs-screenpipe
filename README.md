@@ -5,7 +5,7 @@
 Built at the *Build Agents That Remember* hackathon (École 42 Paris, October 16 to 18, 2026), Track 3: *Make it work for a team*.
 
 <!-- TODO: replace with the Loom link -->
-[Watch the 2-minute demo](https://www.loom.com/share/REPLACE_ME)
+[Watch the 2-minute demo]([https://www.loom.com/share/7fbbfc02c66b40ad86265f5484063eb4])
 
 ## What it does
 
