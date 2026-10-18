@@ -1,7 +1,7 @@
 [Desktop Entry]
 Name=Team Memory
 Comment=Lance le workflow Screenpipe x Notion
-Exec=bash -c "streamlit run telecommande.py"
+Exec=bash -c "streamlit run TeamMind.py"
 Icon=utilities-terminal
 Terminal=false
 Type=Application

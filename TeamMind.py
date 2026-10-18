@@ -216,9 +216,47 @@ def api_base():
     return f"http://localhost:{api_port()}"
 
 
+def find_screenpipe_cli():
+    """The Screenpipe CLI (not the desktop AppImage): PATH, ~/.screenpipe/cli, ~/.local/bin."""
+    path = shutil.which("screenpipe")
+    if path:
+        return path
+    cands = glob.glob(os.path.expanduser("~/.screenpipe/cli/**/screenpipe*"), recursive=True)
+    cands.append(os.path.expanduser("~/.local/bin/screenpipe"))
+    for c in cands:
+        if os.path.isfile(c) and os.access(c, os.X_OK) and not c.endswith((".json", ".log", ".txt")):
+            return c
+    return None
+
+
+def get_api_token():
+    """API token: env var, then Screenpipe settings, then `screenpipe auth token` (cached)."""
+    token = os.getenv("SCREENPIPE_API_KEY") or read_store_settings().get("apiKey") or ""
+    if token:
+        return token
+    token = st.session_state.get("sp_token_auto", "")
+    if token:
+        return token
+    if time.time() - st.session_state.get("sp_token_fail", 0) < 20:  # do not retry on every refresh
+        return ""
+    cli = find_screenpipe_cli()
+    if cli:
+        try:
+            res = subprocess.run([cli, "auth", "token"], capture_output=True, text=True, timeout=15)
+            lines = [l.strip() for l in res.stdout.splitlines() if l.strip()]
+            if res.returncode == 0 and lines:
+                candidate = lines[-1].split()[-1]
+                if len(candidate) >= 12:
+                    st.session_state["sp_token_auto"] = candidate
+                    return candidate
+        except Exception:
+            pass
+    st.session_state["sp_token_fail"] = time.time()
+    return ""
+
+
 def api_headers():
-    token = (os.getenv("SCREENPIPE_API_KEY") or st.session_state.get("sp_token", "")
-             or read_store_settings().get("apiKey") or "")
+    token = get_api_token()
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 
@@ -271,6 +309,8 @@ def find_screenpipe_executable():
 
 
 def start_screenpipe_low_resource():
+    st.session_state.pop("sp_token_auto", None)
+    st.session_state.pop("sp_token_fail", None)
     if is_screenpipe_running():
         return True, "Screenpipe is already running (port 3030 active)."
 
@@ -336,7 +376,10 @@ def fetch_and_clean_session(limit=60):
         r = requests.get(f"{api_base()}/search", params={"content_type": "ocr", "limit": limit},
                          headers=api_headers(), timeout=10)
         if r.status_code != 200:
-            return f"Screenpipe returned HTTP {r.status_code}: {r.text[:200]}", []
+            hint = (" Could not get the API token automatically: run `screenpipe auth token` and set it "
+                    "in the SCREENPIPE_API_KEY environment variable before launching TeamMind."
+                    if r.status_code in (401, 403) else "")
+            return f"Screenpipe returned HTTP {r.status_code}: {r.text[:120]}{hint}", []
         items = r.json().get("data", [])
     except Exception as e:
         return f"Error reading Screenpipe: {e}", []
@@ -430,6 +473,11 @@ END_OF_SESSION = re.compile(r"end[\s_-]*of[\s_-]*session|session[\s_-]*end|wrap[
 def notion_headers():
     return {"Authorization": f"Bearer {DEFAULT_NOTION_KEY}", "Content-Type": "application/json",
             "Notion-Version": NOTION_VERSION}
+
+
+def is_notion_url(url):
+    host = url.lower().split("//")[-1].split("/")[0]
+    return host.endswith("notion.so") or host.endswith("notion.site")
 
 
 def notion_page_id(url):
@@ -592,8 +640,7 @@ def logo_html(path):
 st.markdown(
     "<div style='text-align:center'>"
     f"{logo_html(logo_path)}"
-    "<h1 style='margin:0.3rem 0 0 0;'>TeamMind</h1>"
-    "<p style='opacity:0.7;margin:0 0 1.5rem 0;'>One-Button Workflow · Track 3: Work as a Team</p>"
+    "<p style='opacity:0.7;margin:0.5rem 0 1.5rem 0;'>One-Button Workflow · Track 3: Work as a Team</p>"
     "</div>",
     unsafe_allow_html=True,
 )
@@ -606,7 +653,7 @@ choice = st.selectbox("📂 Project", list(projects) + [NEW_PROJECT], key="proje
 project, project_url = None, ""
 if choice == NEW_PROJECT:
     new_name = st.text_input("Project name", key="new_name")
-    new_url = st.text_input("Notion page URL (project knowledge base)", key="new_url")
+    new_url = st.text_input("Project URL (Notion, Google Docs, ...)", key="new_url")
     if st.button("Create project", disabled=not new_name.strip()):
         projects[new_name.strip()] = new_url.strip()
         save_projects(projects)
@@ -614,11 +661,7 @@ if choice == NEW_PROJECT:
         st.rerun()
 else:
     project = choice
-    project_url = st.text_input("🔗 Notion page URL (project knowledge base)", value=projects[choice],
-                                key=f"url_{choice}").strip()
-    if project_url != projects[choice]:
-        projects[choice] = project_url
-        save_projects(projects)
+    project_url = projects[choice]  # remembered: no need to type it again
 
 # Status messages that are recomputed on every refresh
 AUTHOR, signed_in = get_screenpipe_author()
@@ -656,9 +699,12 @@ if stop_clicked:
             msgs.append(("error", f"{corpus} (Screenpipe left running)"))
         else:
             st.session_state["output_text"] = None
-            notion_ready = bool(DEFAULT_NOTION_KEY and project_url)
+            notion_ready = bool(DEFAULT_NOTION_KEY and project_url and is_notion_url(project_url))
             description, template = "", ""
-            if notion_ready:
+            if project_url and not is_notion_url(project_url):
+                msgs.append(("info", "The project URL is not a Notion page: default prompt used and nothing is "
+                                     "published automatically (only Notion pages are supported for now)."))
+            elif notion_ready:
                 description, template, err = fetch_project_page(project_url)
                 if err:
                     msgs.append(("warning", f"Could not read the project's Notion page: {err}. Using the default prompt."))
