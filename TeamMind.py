@@ -10,6 +10,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -216,17 +217,30 @@ def api_base():
     return f"http://localhost:{api_port()}"
 
 
-def find_screenpipe_cli():
-    """The Screenpipe CLI (not the desktop AppImage): PATH, ~/.screenpipe/cli, ~/.local/bin."""
-    path = shutil.which("screenpipe")
-    if path:
-        return path
-    cands = glob.glob(os.path.expanduser("~/.screenpipe/cli/**/screenpipe*"), recursive=True)
-    cands.append(os.path.expanduser("~/.local/bin/screenpipe"))
-    for c in cands:
-        if os.path.isfile(c) and os.access(c, os.X_OK) and not c.endswith((".json", ".log", ".txt")):
-            return c
-    return None
+def find_screenpipe_clis():
+    """Candidate Screenpipe CLI binaries (not the desktop AppImage), best first:
+    the engine process that is currently running, PATH, ~/.screenpipe/cli, ~/.local/bin."""
+    found = []
+
+    def add(path):
+        if path and path not in found and os.path.isfile(path) and os.access(path, os.X_OK) \
+                and not path.endswith((".json", ".log", ".txt")) and "appimage" not in path.lower():
+            found.append(path)
+
+    try:
+        out = subprocess.run(["ps", "-eo", "args="], capture_output=True, text=True, timeout=5).stdout
+        for line in out.splitlines():
+            exe = line.strip().split(" ")[0] if line.strip() else ""
+            name = os.path.basename(exe)
+            if name.startswith("screenpipe") and not name.endswith("-app"):
+                add(exe)
+    except Exception:
+        pass
+    add(shutil.which("screenpipe"))
+    for c in glob.glob(os.path.expanduser("~/.screenpipe/cli/**/screenpipe*"), recursive=True):
+        add(c)
+    add(os.path.expanduser("~/.local/bin/screenpipe"))
+    return found
 
 
 def get_api_token():
@@ -239,18 +253,18 @@ def get_api_token():
         return token
     if time.time() - st.session_state.get("sp_token_fail", 0) < 20:  # do not retry on every refresh
         return ""
-    cli = find_screenpipe_cli()
-    if cli:
+    tried = []
+    for cli in find_screenpipe_clis():
         try:
             res = subprocess.run([cli, "auth", "token"], capture_output=True, text=True, timeout=15)
             lines = [l.strip() for l in res.stdout.splitlines() if l.strip()]
-            if res.returncode == 0 and lines:
-                candidate = lines[-1].split()[-1]
-                if len(candidate) >= 12:
-                    st.session_state["sp_token_auto"] = candidate
-                    return candidate
-        except Exception:
-            pass
+            if res.returncode == 0 and lines and len(lines[-1].split()[-1]) >= 12:
+                st.session_state["sp_token_auto"] = lines[-1].split()[-1]
+                return st.session_state["sp_token_auto"]
+            tried.append(f"{cli} -> exit {res.returncode}: {(res.stderr or res.stdout).strip()[:80]}")
+        except Exception as e:
+            tried.append(f"{cli} -> {type(e).__name__}")
+    st.session_state["sp_token_debug"] = "; ".join(tried) if tried else "no Screenpipe CLI binary found"
     st.session_state["sp_token_fail"] = time.time()
     return ""
 
@@ -261,15 +275,24 @@ def api_headers():
 
 
 def probe_screenpipe():
-    """Returns (is_up, detail). Any HTTP answer below 500 means the server is up
-    (a 401/403 means it is up but wants an auth token)."""
+    """Returns (is_up, detail). Only counts as Screenpipe if the answer looks like Screenpipe's API
+    (another program on the same port must not be mistaken for it)."""
     last = "no connection"
     for path in ("/health", "/search?limit=1"):
         try:
             r = requests.get(f"{api_base()}{path}", headers=api_headers(), timeout=2)
             last = f"GET {path} -> HTTP {r.status_code}"
-            if r.status_code < 500:
-                return True, last
+            body = r.text[:800].lower()
+            if r.status_code == 200:
+                try:
+                    j = r.json()
+                except Exception:
+                    j = None
+                if isinstance(j, dict) and (path == "/health" and any(
+                        k in j for k in ("status", "frame_status", "audio_status")) or "data" in j):
+                    return True, last
+            elif r.status_code in (401, 403) and ("screenpipe" in body or "api access" in body):
+                return True, last  # Screenpipe is up but wants a token
         except Exception as e:
             last = f"GET {path} -> {type(e).__name__}"
     return False, last
@@ -280,9 +303,15 @@ def is_screenpipe_running():
 
 
 def find_screenpipe_executable():
-    """Returns (path, kind) with kind in {'appimage', 'app', 'cli'} or (None, None)."""
+    """Returns (path, kind) with kind in {'appimage', 'macapp', 'cli'} or (None, None).
+    Set SCREENPIPE_PATH to force a location (.app, .AppImage or binary)."""
+    forced = os.getenv("SCREENPIPE_PATH", "").strip()
+    if forced and os.path.exists(forced):
+        low = forced.lower().rstrip("/")
+        return forced, ("appimage" if low.endswith(".appimage") else "macapp" if low.endswith(".app") else "cli")
+
     search_dirs = [SCRIPT_DIR, Path.cwd(), HOME / "Desktop", HOME / "Downloads", HOME,
-                   HOME / "Applications", HOME / ".local/bin", Path("/opt")]
+                   HOME / "Applications", HOME / ".local/bin", Path("/opt"), Path("/Applications")]
     seen = set()
     for d in search_dirs:
         if str(d) in seen or not d.is_dir():
@@ -290,34 +319,49 @@ def find_screenpipe_executable():
         seen.add(str(d))
         try:
             for f in sorted(d.iterdir()):
-                if f.is_file() and f.name.lower().endswith(".appimage") and "screenpipe" in f.name.lower():
+                name = f.name.lower()
+                if "screenpipe" not in name and "screenpi.pe" not in name:
+                    continue
+                if f.is_file() and name.endswith(".appimage"):
                     return str(f.resolve()), "appimage"
+                if f.is_dir() and name.endswith(".app"):
+                    return str(f.resolve()), "macapp"
         except OSError:
             continue
 
-    mac_app = "/Applications/screenpipe.app/Contents/MacOS/screenpipe"
-    if os.path.exists(mac_app):
-        return mac_app, "app"
+    if sys.platform == "darwin":
+        # Any location known to macOS (LaunchServices / Spotlight)
+        for name in ("Screenpipe", "screenpipe"):
+            try:
+                if subprocess.run(["open", "-Ra", name], capture_output=True, timeout=10).returncode == 0:
+                    return name, "macapp"
+            except Exception:
+                pass
+        try:
+            out = subprocess.run(["mdfind", "-name", "screenpipe"], capture_output=True, text=True, timeout=10).stdout
+            for line in out.splitlines():
+                if line.strip().lower().endswith(".app") and os.path.isdir(line.strip()):
+                    return line.strip(), "macapp"
+        except Exception:
+            pass
 
-    binary = shutil.which("screenpipe")
-    if binary:
-        return binary, "cli"
-    for p in (HOME / ".local/bin/screenpipe", Path("/usr/local/bin/screenpipe")):
-        if p.exists():
-            return str(p), "cli"
+    clis = find_screenpipe_clis()
+    if clis:
+        return clis[0], "cli"
     return None, None
 
 
 def start_screenpipe_low_resource():
     st.session_state.pop("sp_token_auto", None)
     st.session_state.pop("sp_token_fail", None)
+    st.session_state.pop("sp_token_debug", None)
     if is_screenpipe_running():
         return True, "Screenpipe is already running (port 3030 active)."
 
     path, kind = find_screenpipe_executable()
     if not path:
-        return False, ("❌ Screenpipe not found. Looked for a *screenpipe*.AppImage in the script folder, "
-                       "current folder, Desktop, Downloads and home, then for the `screenpipe` binary in PATH.")
+        return False, ("❌ Screenpipe not found. Install the Screenpipe app, or set SCREENPIPE_PATH to its location "
+                       "(.app, .AppImage or binary), then restart TeamMind.")
 
     env = dict(os.environ)
     if kind == "appimage":
@@ -325,8 +369,8 @@ def start_screenpipe_low_resource():
         env["APPIMAGE_EXTRACT_AND_RUN"] = "1"  # works even without FUSE
         # The AppImage is the desktop app: it records on its own, no CLI arguments.
         cmd = [path]
-    elif kind == "app":
-        cmd = [path]
+    elif kind == "macapp":
+        cmd = ["open", "-a", path]
     else:
         cmd = [path, "record", "--fps", "0.2", "--disable-audio"]
 
@@ -376,8 +420,8 @@ def fetch_and_clean_session(limit=60):
         r = requests.get(f"{api_base()}/search", params={"content_type": "ocr", "limit": limit},
                          headers=api_headers(), timeout=10)
         if r.status_code != 200:
-            hint = (" Could not get the API token automatically: run `screenpipe auth token` and set it "
-                    "in the SCREENPIPE_API_KEY environment variable before launching TeamMind."
+            hint = (f" Could not get the API token automatically ({st.session_state.get('sp_token_debug', 'unknown reason')}). "
+                    "Run `screenpipe auth token` and set it in SCREENPIPE_API_KEY before launching TeamMind."
                     if r.status_code in (401, 403) else "")
             return f"Screenpipe returned HTTP {r.status_code}: {r.text[:120]}{hint}", []
         items = r.json().get("data", [])
@@ -678,7 +722,9 @@ else:
     status_messages.append(("info", "ℹ️ No usable AI found: copy-paste mode. You will get a prompt to paste into "
                                     f"Screenpipe's chat. {note}".strip()))
 
-running = is_screenpipe_running()
+running, running_detail = probe_screenpipe()
+if running:
+    status_messages.append(("info", f"Screenpipe is already running ({running_detail})."))
 col_start, col_stop = st.columns(2)
 start_clicked = col_start.button("▶️ 1. Start my day", use_container_width=True, type="primary", disabled=running)
 stop_clicked = col_stop.button("⏹️ 2. Wrap up & publish to Notion", use_container_width=True,
