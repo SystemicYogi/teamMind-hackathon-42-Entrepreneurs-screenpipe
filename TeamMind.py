@@ -6,6 +6,7 @@ import getpass
 import glob
 import json
 import re
+import secrets
 import os
 import shutil
 import signal
@@ -243,30 +244,61 @@ def find_screenpipe_clis():
     return found
 
 
+KEY_FILE = HOME / ".teammind" / "api_key"
+
+
+def local_api_key(create=False):
+    """A key TeamMind generates once and hands to Screenpipe (SCREENPIPE_API_KEY) when it starts it."""
+    try:
+        if KEY_FILE.exists():
+            return KEY_FILE.read_text().strip()
+        if create:
+            KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
+            key = secrets.token_urlsafe(32)
+            KEY_FILE.write_text(key)
+            os.chmod(KEY_FILE, 0o600)
+            return key
+    except OSError:
+        pass
+    return ""
+
+
+def _cli_env():
+    """Environment for the CLI: also expose the libraries bundled in a running AppImage."""
+    env = dict(os.environ)
+    libs = []
+    for root in ("/tmp/.mount_screen*", "/tmp/appimage_extracted_*"):
+        libs += glob.glob(root + "/usr/lib*") + glob.glob(root + "/usr/lib/x86_64-linux-gnu")
+    if libs:
+        env["LD_LIBRARY_PATH"] = ":".join(libs + [env.get("LD_LIBRARY_PATH", "")])
+    return env
+
+
 def get_api_token():
-    """API token: env var, then Screenpipe settings, then `screenpipe auth token` (cached)."""
+    """API token: env var, Screenpipe settings, `screenpipe auth token` (cached), then TeamMind's own key."""
     token = os.getenv("SCREENPIPE_API_KEY") or read_store_settings().get("apiKey") or ""
     if token:
         return token
     token = st.session_state.get("sp_token_auto", "")
     if token:
         return token
-    if time.time() - st.session_state.get("sp_token_fail", 0) < 20:  # do not retry on every refresh
-        return ""
-    tried = []
-    for cli in find_screenpipe_clis():
-        try:
-            res = subprocess.run([cli, "auth", "token"], capture_output=True, text=True, timeout=15)
-            lines = [l.strip() for l in res.stdout.splitlines() if l.strip()]
-            if res.returncode == 0 and lines and len(lines[-1].split()[-1]) >= 12:
-                st.session_state["sp_token_auto"] = lines[-1].split()[-1]
-                return st.session_state["sp_token_auto"]
-            tried.append(f"{cli} -> exit {res.returncode}: {(res.stderr or res.stdout).strip()[:80]}")
-        except Exception as e:
-            tried.append(f"{cli} -> {type(e).__name__}")
-    st.session_state["sp_token_debug"] = "; ".join(tried) if tried else "no Screenpipe CLI binary found"
-    st.session_state["sp_token_fail"] = time.time()
-    return ""
+    if time.time() - st.session_state.get("sp_token_fail", 0) >= 20:  # do not retry on every refresh
+        tried = []
+        for cli in find_screenpipe_clis():
+            try:
+                res = subprocess.run([cli, "auth", "token"], capture_output=True, text=True, timeout=15,
+                                     env=_cli_env())
+                lines = [l.strip() for l in res.stdout.splitlines() if l.strip()]
+                if res.returncode == 0 and lines and len(lines[-1].split()[-1]) >= 12:
+                    st.session_state["sp_token_auto"] = lines[-1].split()[-1]
+                    return st.session_state["sp_token_auto"]
+                why = "a system library is missing" if res.returncode == 127 else (res.stderr or res.stdout).strip()[:60]
+                tried.append(f"{os.path.basename(cli)} exit {res.returncode}: {why}")
+            except Exception as e:
+                tried.append(f"{os.path.basename(cli)}: {type(e).__name__}")
+        st.session_state["sp_token_debug"] = "; ".join(tried) if tried else "no Screenpipe CLI binary found"
+        st.session_state["sp_token_fail"] = time.time()
+    return local_api_key()
 
 
 def api_headers():
@@ -364,6 +396,8 @@ def start_screenpipe_low_resource():
                        "(.app, .AppImage or binary), then restart TeamMind.")
 
     env = dict(os.environ)
+    if not env.get("SCREENPIPE_API_KEY"):
+        env["SCREENPIPE_API_KEY"] = local_api_key(create=True)  # so TeamMind knows the API key
     if kind == "appimage":
         os.chmod(path, 0o755)
         env["APPIMAGE_EXTRACT_AND_RUN"] = "1"  # works even without FUSE
@@ -421,7 +455,8 @@ def fetch_and_clean_session(limit=60):
                          headers=api_headers(), timeout=10)
         if r.status_code != 200:
             hint = (f" Could not get the API token automatically ({st.session_state.get('sp_token_debug', 'unknown reason')}). "
-                    "Run `screenpipe auth token` and set it in SCREENPIPE_API_KEY before launching TeamMind."
+                    "If Screenpipe was already running, quit it and click Start again: TeamMind then launches it "
+                    "with its own API key."
                     if r.status_code in (401, 403) else "")
             return f"Screenpipe returned HTTP {r.status_code}: {r.text[:120]}{hint}", []
         items = r.json().get("data", [])
